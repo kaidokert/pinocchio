@@ -35,14 +35,34 @@ LARGE_STEP_SIZE = 10.0  # degrees with Shift
 DT = 0.01  # simulation timestep
 STORE_DIR = Path("store")  # Directory for saved states
 
+# Parse command line arguments BEFORE loading model
+parser = argparse.ArgumentParser(description="SO101 Robot Arm Simulation")
+parser.add_argument(
+    '--collision',
+    action='store_true',
+    help='Enable collision detection'
+)
+parser.add_argument(
+    '--urdf',
+    type=str,
+    default='so101.urdf',
+    help='URDF filename (default: so101.urdf, or use: so101_simple_collision.urdf)'
+)
+args = parser.parse_args()
+
 try:
     logger.info("Getting model paths from environment")
     # Get model paths from environment
     model_path = Path(os.environ.get("EXAMPLE_ROBOT_DATA_MODEL_DIR"))
     mesh_dir = model_path.parent.parent
-    urdf_model_path = model_path / "so_arm_description/urdf/so101.urdf"
+
+    # Use specified URDF file
+    urdf_model_path = model_path / f"so_arm_description/urdf/{args.urdf}"
     logger.info(f"URDF path: {urdf_model_path}")
     logger.info(f"Mesh dir: {mesh_dir}")
+
+    if not urdf_model_path.exists():
+        raise FileNotFoundError(f"URDF not found: {urdf_model_path}")
 
     logger.info("Loading robot model from URDF...")
     # Load robot model
@@ -123,10 +143,15 @@ class SO101Simulation:
         self.collision_detected = False
         self.colliding_pairs = []
         self.enable_collision_detection = enable_collision
-        self.show_collision_geom = False  # Toggle for collision geometry visualization
+        self.show_collision_geom = enable_collision  # Show by default when collision enabled
+        self.prevent_collisions = enable_collision  # Prevent commanded motions that would collide
 
         # Display initial state
         self.viz.display(self.q)
+
+        # Show collision geometries by default if collision detection is enabled
+        if self.enable_collision_detection:
+            self.update_collision_visualization()
 
     def add_ground_plane(self):
         """Add a ground plane to MeshCat."""
@@ -175,8 +200,8 @@ class SO101Simulation:
 
             logger.info(f"After addAllCollisionPairs: {len(collision_model.collisionPairs)} collision pairs")
 
-            # Remove collision pairs for adjacent links (they're always in contact by design)
-            logger.info("Filtering out adjacent link collision pairs...")
+            # Filter collision pairs based on geometry type
+            logger.info("Filtering collision pairs...")
             pairs_to_remove = []
 
             for pair in collision_model.collisionPairs:
@@ -186,26 +211,18 @@ class SO101Simulation:
                 joint1_idx = geom1.parentJoint
                 joint2_idx = geom2.parentJoint
 
-                # Check if joints are the same (same link)
+                # Only remove same-link pairs (geometries on the same link)
+                # For simplified box geometry, adjacent links are designed with gaps
+                # so we don't need to filter adjacent-link pairs anymore
                 if joint1_idx == joint2_idx:
                     pairs_to_remove.append(pair)
-                    continue
+                    logger.debug(f"Removing same-link pair: {geom1.name} <-> {geom2.name}")
 
-                # Check if one joint is the parent of the other (adjacent links)
-                # Get parent of joint1
-                parent1_idx = model.parents[joint1_idx]
-                parent2_idx = model.parents[joint2_idx]
-
-                if joint1_idx == parent2_idx or joint2_idx == parent1_idx:
-                    # Adjacent links in kinematic chain
-                    pairs_to_remove.append(pair)
-                    logger.debug(f"Removing adjacent pair: {geom1.name} <-> {geom2.name}")
-
-            # Remove the adjacent pairs
+            # Remove the filtered pairs
             for pair in pairs_to_remove:
                 collision_model.removeCollisionPair(pair)
 
-            logger.info(f"Removed {len(pairs_to_remove)} adjacent link collision pairs")
+            logger.info(f"Removed {len(pairs_to_remove)} same-link collision pairs")
             logger.info(f"Final collision pairs: {len(collision_model.collisionPairs)} pairs")
 
         except Exception as e:
@@ -433,6 +450,51 @@ class SO101Simulation:
         config_idx = JOINT_INDICES[joint_idx]
         self.q[config_idx] = np.radians(value_deg)
 
+    def would_collide(self, q_test):
+        """Check if a given configuration would cause collision (without modifying current state)."""
+        if not self.enable_collision_detection or not self.prevent_collisions:
+            return False
+
+        try:
+            # Create temporary data for collision checking
+            data_test = pin.Data(model)
+            collision_data_test = pin.GeometryData(collision_model)
+
+            # Update collision geometry placements with test configuration
+            pin.updateGeometryPlacements(model, data_test, collision_model, collision_data_test, q_test)
+
+            # Compute collisions (stop at first for efficiency)
+            is_colliding = pin.computeCollisions(collision_model, collision_data_test, stop_at_first_collision=True)
+
+            return is_colliding
+        except Exception as e:
+            logger.warning(f"Error in would_collide: {e}")
+            return False  # On error, allow the motion (fail-safe)
+
+    def set_joint_position_safe(self, joint_idx, value_deg):
+        """
+        Safely set joint position, checking for collisions first.
+        Returns True if motion was applied, False if rejected due to collision.
+        """
+        if not self.prevent_collisions:
+            # No collision prevention - apply directly
+            self.set_joint_position(joint_idx, value_deg)
+            return True
+
+        # Create test configuration
+        q_test = self.q.copy()
+        config_idx = JOINT_INDICES[joint_idx]
+        q_test[config_idx] = np.radians(value_deg)
+
+        # Check if this would cause collision
+        if self.would_collide(q_test):
+            # Collision detected - reject motion
+            return False
+        else:
+            # Safe to apply
+            self.set_joint_position(joint_idx, value_deg)
+            return True
+
     def draw_bar(self, value, width=20, min_val=-180, max_val=180):
         """Draw a horizontal bar representing a value in degrees."""
         normalized = (value - min_val) / (max_val - min_val)
@@ -565,12 +627,57 @@ class SO101Simulation:
         self.update_display()
         self.add_command("Moved to home position")
 
+    def reload_urdf(self):
+        """Reload URDF from disk (for live tuning workflow)."""
+        global model, collision_model, visual_model
+
+        logger.info("Reloading URDF from disk...")
+        self.add_command("Reloading URDF...")
+
+        try:
+            # Reload models from URDF
+            model, collision_model, visual_model = pin.buildModelsFromUrdf(
+                str(urdf_model_path), str(mesh_dir), pin.JointModelFreeFlyer()
+            )
+            logger.info(f"URDF reloaded: {collision_model.ngeoms} collision geometries")
+
+            # Recreate data structures
+            self.data = pin.Data(model)
+
+            # Re-setup collision if enabled
+            if self.enable_collision_detection:
+                self.setup_collision_pairs()
+                self.collision_data = pin.GeometryData(collision_model)
+                logger.info("Collision model reloaded")
+
+            # Update visualizer with new models
+            self.viz.model = model
+            self.viz.collision_model = collision_model
+            self.viz.visual_model = visual_model
+            self.viz.data = self.data
+
+            # Reload viewer geometry
+            self.viz.loadViewerModel()
+
+            # Reset configuration to neutral
+            self.q = pin.neutral(model)
+            self.v = np.zeros(model.nv)
+            self.q[2] = 0.0
+
+            # Update display
+            self.viz.display(self.q)
+
+            self.add_command(f"URDF reloaded ({collision_model.ngeoms} geoms)")
+            logger.info("URDF reload complete")
+
+        except Exception as e:
+            logger.error(f"Failed to reload URDF: {e}", exc_info=True)
+            self.add_command(f"ERROR: Reload failed - {e}")
+
     def reset_simulation(self):
-        """Reset entire simulation to initial state."""
-        # Reset robot configuration
-        self.q = pin.neutral(model)
-        self.v = np.zeros(model.nv)
-        self.q[2] = 0.0  # Base on ground
+        """Reset entire simulation to initial state and reload URDF."""
+        # Reload URDF to pick up any changes
+        self.reload_urdf()
 
         # Reset ball
         self.ball_pos = np.array([0.3, 0.3, 0.5])
@@ -579,7 +686,7 @@ class SO101Simulation:
         # Update displays
         self.update_display()
         self.update_ball_position()
-        self.add_command("Simulation reset")
+        self.add_command("Simulation reset + URDF reloaded")
 
     def apply_gravity(self):
         """Let arm drop under gravity for a moment."""
@@ -731,35 +838,47 @@ class SO101Simulation:
                             step = LARGE_STEP_SIZE if key.name == 'KEY_SUP' else STEP_SIZE
                             old_pos = self.get_joint_position(self.selected_joint)
                             new_pos = old_pos + step
-                            self.set_joint_position(self.selected_joint, new_pos)
-                            self.update_display()
                             joint_name = JOINT_NAMES[self.selected_joint]
-                            self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+
+                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                self.update_display()
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+                            else:
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
 
                         elif key.name == 'KEY_DOWN' or key.lower() == 's':
                             step = LARGE_STEP_SIZE if key.name == 'KEY_SDOWN' else STEP_SIZE
                             old_pos = self.get_joint_position(self.selected_joint)
                             new_pos = old_pos - step
-                            self.set_joint_position(self.selected_joint, new_pos)
-                            self.update_display()
                             joint_name = JOINT_NAMES[self.selected_joint]
-                            self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+
+                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                self.update_display()
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+                            else:
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
 
                         elif key.lower() in ['+', '=']:
                             old_pos = self.get_joint_position(self.selected_joint)
                             new_pos = old_pos + LARGE_STEP_SIZE
-                            self.set_joint_position(self.selected_joint, new_pos)
-                            self.update_display()
                             joint_name = JOINT_NAMES[self.selected_joint]
-                            self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+
+                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                self.update_display()
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+                            else:
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
 
                         elif key.lower() in ['-', '_']:
                             old_pos = self.get_joint_position(self.selected_joint)
                             new_pos = old_pos - LARGE_STEP_SIZE
-                            self.set_joint_position(self.selected_joint, new_pos)
-                            self.update_display()
                             joint_name = JOINT_NAMES[self.selected_joint]
-                            self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+
+                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                self.update_display()
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+                            else:
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
 
                     except Exception as e:
                         # Log exceptions in the inner loop but continue running
@@ -786,25 +905,13 @@ class SO101Simulation:
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='SO101 Robot Arm Simulation')
-    parser.add_argument(
-        '--collision',
-        action='store_true',
-        help='Enable collision detection (default: disabled)'
-    )
-    parser.add_argument(
-        '--no-collision',
-        action='store_true',
-        help='Disable collision detection (explicit, same as default)'
-    )
-    args = parser.parse_args()
-
-    # Determine collision setting (--collision wins if both specified)
-    enable_collision = args.collision and not args.no_collision
+    # Arguments already parsed at top of file
+    enable_collision = args.collision
 
     print("Starting SO101 simulation...")
+    print(f"URDF: {args.urdf}")
     print(f"Collision detection: {'ENABLED' if enable_collision else 'DISABLED'}")
+    print(f"Collision geometries: {collision_model.ngeoms}")
     print("Open the visualizer at: http://127.0.0.1:7000/static/")
     print("Press any key to start...")
 
