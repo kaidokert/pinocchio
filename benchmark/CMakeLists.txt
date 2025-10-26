@@ -97,8 +97,8 @@ add_pinocchio_bench(timings-cholesky PARSERS)
 # timings derivatives
 #
 add_pinocchio_bench(timings-derivatives PARSERS)
-if(BUILD_WITH_AUTODIFF_SUPPORT)
-  # timings-cppad-jit
+if(BUILD_WITH_AUTODIFF_SUPPORT AND BUILD_WITH_CODEGEN_SUPPORT)
+  # timings-cppad-jit (requires both autodiff and codegen support)
   add_pinocchio_bench(timings-cppad-jit CPPAD)
 endif()
 

@@ -14,3 +14,9 @@ coverage*
 
 # benchmark
 plot.html
+
+# Build script temp files
+.conda_prefix_*.tmp
+
+# Simulation saved states
+store/

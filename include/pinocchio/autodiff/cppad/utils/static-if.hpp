@@ -35,6 +35,9 @@ namespace pinocchio
           return ::CppAD::CondExpGe<Scalar>(lhs_value, rhs_value, then_value, else_value);
         case GT:
           return ::CppAD::CondExpGt<Scalar>(lhs_value, rhs_value, then_value, else_value);
+        default:
+          PINOCCHIO_THROW_PRETTY(
+            std::logic_error, "ComparisonOperators " << static_cast<int>(op) << " is not managed");
         }
       }
     };
