@@ -147,6 +147,7 @@ class SO101Simulation:
         self.last_command = "Ready"
         self.command_history = []
         self.paused = False
+        self.gravity_enabled = False
         self.collision_detected = False
         self.colliding_pairs = []
         self.enable_collision_detection = enable_collision
@@ -240,10 +241,10 @@ class SO101Simulation:
         import hppfcl
 
         # Cup position in world
-        cup_pos = np.array([0.3, 0.0, 0.05])  # 30cm in front, on ground
+        cup_pos = np.array([0.3, 0.0, 0.00])  # 30cm in front, 2cm above ground
 
         # SCALE FACTOR: Adjust this to change cup size (ideal ~0.035 for 8cm cup)
-        CUP_SCALE_FACTOR = 0.035
+        CUP_SCALE_FACTOR = 0.055
 
         # Load cup_3.dae (path relative to examples directory)
         cup_mesh_path = (Path(__file__).parent.parent / "models/scene/cup_3.dae").absolute()
@@ -324,7 +325,7 @@ class SO101Simulation:
 
         # Create a red sphere
         self.viz.viewer["test_ball"].set_object(
-            g.Sphere(0.03),  # 5cm radius
+            g.Sphere(0.03),  # 3cm radius
             g.MeshLambertMaterial(color=0xff0000)  # Red
         )
         self.update_ball_position()
@@ -719,6 +720,10 @@ class SO101Simulation:
         collision_status = "ON" if self.enable_collision_detection else "OFF"
         lines.append(f"  Collision Detection: {t.cyan}{collision_status}{t.normal} - {collision_color}{collision_text}{t.normal}")
 
+        # Gravity status
+        gravity_status = f"{t.green}ON{t.normal}" if self.gravity_enabled else f"{t.normal}OFF{t.normal}"
+        lines.append(f"  Gravity: {gravity_status}")
+
         # Show colliding pairs if any
         if self.collision_detected and len(self.colliding_pairs) > 0:
             lines.append(f"  {t.red}Colliding Pairs ({len(self.colliding_pairs)}):{t.normal}")
@@ -792,7 +797,7 @@ class SO101Simulation:
         col2 = [
             (f"{t.yellow}+/-{t.normal}    Large (+/-{LARGE_STEP_SIZE}deg)"),
             (f"{t.yellow}SPC{t.normal}    Pause/Resume"),
-            (f"{t.yellow}G{t.normal}      Apply gravity"),
+            (f"{t.yellow}G{t.normal}      Toggle gravity"),
             (f"{t.yellow}C{t.normal}      Toggle collision"),
             (f"{t.yellow}V{t.normal}      Toggle viz"),
             (f"{t.yellow}E{t.normal}      Toggle env"),
@@ -911,61 +916,64 @@ class SO101Simulation:
         self.update_ball_position()
         self.add_command("Simulation reset + URDF reloaded")
 
-    def apply_gravity(self):
-        """Let arm drop under gravity for a moment."""
-        self.add_command("Applying gravity...")
+    def toggle_gravity(self):
+        """Toggle gravity on/off."""
+        self.gravity_enabled = not self.gravity_enabled
+        if self.gravity_enabled:
+            # Reset ball position for new drop
+            self.ball_pos = np.array([0.3, 0.3, 0.5])
+            self.ball_vel = np.zeros(3)
+            self.add_command("Gravity ON")
+        else:
+            # Stop all motion
+            self.v = np.zeros(model.nv)
+            self.ball_vel = np.zeros(3)
+            self.add_command("Gravity OFF")
 
-        # Reset ball position for new drop
-        self.ball_pos = np.array([0.3, 0.3, 0.5])
-        self.ball_vel = np.zeros(3)
+    def update_physics(self, dt):
+        """Update physics simulation for one timestep."""
+        if not self.gravity_enabled or self.paused:
+            return
 
         # Gravity constant
         gravity = np.array([0, 0, -9.81])  # m/s^2
 
-        # Proper gravity simulation using forward dynamics
-        # Note: First 6 DOF are the free-flyer base
+        # ---- Robot dynamics ----
         tau = np.zeros(model.nv)  # No control torques
 
-        for _ in range(100):  # 1 second of simulation
-            # ---- Robot dynamics ----
-            # Compute forward dynamics (ABA algorithm)
-            a = pin.aba(model, self.data, self.q, self.v, tau)
+        # Compute forward dynamics (ABA algorithm)
+        a = pin.aba(model, self.data, self.q, self.v, tau)
 
-            # Lock the base position (first 6 DOF)
-            a[:6] = 0.0
+        # Lock the base position (first 6 DOF)
+        a[:6] = 0.0
 
-            # Add damping to arm joints
-            a[6:] *= 0.95  # 5% damping
+        # Add damping to arm joints
+        a[6:] *= 0.95  # 5% damping
 
-            # Integrate velocity
-            self.v += a * DT
-            self.v[:6] = 0.0  # Lock base velocity
+        # Integrate velocity
+        self.v += a * dt
+        self.v[:6] = 0.0  # Lock base velocity
 
-            # Integrate position
-            self.q = pin.integrate(model, self.q, self.v * DT)
+        # Integrate position
+        self.q = pin.integrate(model, self.q, self.v * dt)
 
-            # ---- Ball physics (simple particle) ----
-            # Apply gravity acceleration
-            self.ball_vel += gravity * DT
+        # ---- Ball physics (simple particle) ----
+        # Apply gravity acceleration
+        self.ball_vel += gravity * dt
 
-            # Update position
-            self.ball_pos += self.ball_vel * DT
+        # Update position
+        self.ball_pos += self.ball_vel * dt
 
-            # Ground collision (simple)
-            if self.ball_pos[2] < 0.05:  # Ball radius
-                self.ball_pos[2] = 0.05
-                self.ball_vel[2] = -self.ball_vel[2] * 0.6  # Bounce with energy loss
-                if abs(self.ball_vel[2]) < 0.1:  # Stop if moving slowly
-                    self.ball_vel[2] = 0
+        # Ground collision (simple)
+        BALL_RADIUS = 0.03  # 3cm radius
+        if self.ball_pos[2] < BALL_RADIUS:
+            self.ball_pos[2] = BALL_RADIUS
+            self.ball_vel[2] = -self.ball_vel[2] * 0.6  # Bounce with energy loss
+            if abs(self.ball_vel[2]) < 0.002:  # Stop if moving < 2mm/s
+                self.ball_vel = np.zeros(3)  # Fully stop the ball
 
-            # Update displays
-            self.update_display()
-            self.update_ball_position()
-            time.sleep(DT)
-
-        self.v = np.zeros(model.nv)  # Stop motion
-        self.ball_vel = np.zeros(3)  # Stop ball
-        self.add_command("Gravity applied")
+        # Update displays
+        self.update_ball_position()
 
     def run(self):
         """Main control loop."""
@@ -980,6 +988,14 @@ class SO101Simulation:
                     try:
                         # Measure frame start time
                         frame_start = time.time()
+
+                        # Update physics simulation
+                        if self.last_frame_time is not None:
+                            dt = frame_start - self.last_frame_time
+                            self.update_physics(dt)
+
+                        # Update visualizer
+                        self.update_display()
 
                         # Draw UI
                         self.draw_ui()
@@ -1043,8 +1059,8 @@ class SO101Simulation:
                             self.reset_simulation()
 
                         elif key.lower() == 'g':
-                            logger.info("Apply gravity requested")
-                            self.apply_gravity()
+                            logger.info("Toggle gravity requested")
+                            self.toggle_gravity()
 
                         # F-keys for saving states (F1-F9)
                         elif key.name and key.name.startswith('KEY_F') and len(key.name) == 6:
