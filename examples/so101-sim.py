@@ -33,6 +33,7 @@ logger.info("=" * 80)
 # Configuration
 STEP_SIZE = 2.0  # degrees per keypress
 LARGE_STEP_SIZE = 10.0  # degrees with Shift
+CARTESIAN_STEP = 0.01  # meters per keypress for Cartesian control (1cm)
 DT = 0.01  # simulation timestep
 STORE_DIR = Path("store")  # Directory for saved states
 
@@ -45,13 +46,14 @@ parser = argparse.ArgumentParser(description="SO101 Robot Arm Simulation")
 parser.add_argument(
     '--collision',
     action='store_true',
+    default=True,
     help='Enable collision detection'
 )
 parser.add_argument(
     '--urdf',
     type=str,
-    default='so101.urdf',
-    help='URDF filename (default: so101.urdf, or use: so101_simple_collision.urdf)'
+    default='so101_simple_collision.urdf',
+    help='URDF filename (default: so101_simple_collision.urdf, or use: so101.urdf)'
 )
 args = parser.parse_args()
 
@@ -111,6 +113,14 @@ class SO101Simulation:
             self.ball_vel = np.zeros(3)
             self.add_test_ball()
 
+            # Cartesian control state (end-effector target)
+            # Will be initialized after forward kinematics is computed
+            self.ee_target_pos = None
+            self.ee_frame_id = model.getFrameId("gripper")
+            ee_frame = model.frames[self.ee_frame_id]
+            self.ee_joint_id = ee_frame.parentJoint
+            logger.info(f"End-effector frame ID: {self.ee_frame_id}, parent joint: {model.names[self.ee_joint_id]} (ID={self.ee_joint_id})")
+
             # Create data object for dynamics
             logger.info("Creating dynamics data")
             self.data = pin.Data(model)
@@ -148,6 +158,7 @@ class SO101Simulation:
         self.command_history = []
         self.paused = False
         self.gravity_enabled = False
+        self.control_mode = "joint"  # "joint" or "cartesian"
         self.collision_detected = False
         self.colliding_pairs = []
         self.enable_collision_detection = enable_collision
@@ -168,6 +179,12 @@ class SO101Simulation:
         self.frame_times = []  # All frame times (for warmup exclusion)
         self.last_frame_time = None
         self.target_hz = TARGET_LOOP_HZ
+
+        # Initialize end-effector target position (use joint pose for consistency)
+        pin.forwardKinematics(model, self.data, self.q)
+        ee_pose = self.data.oMi[self.ee_joint_id]
+        self.ee_target_pos = ee_pose.translation.copy()
+        logger.info(f"Initial end-effector position: {self.ee_target_pos}")
 
         # Display initial state
         self.viz.display(self.q)
@@ -724,6 +741,13 @@ class SO101Simulation:
         gravity_status = f"{t.green}ON{t.normal}" if self.gravity_enabled else f"{t.normal}OFF{t.normal}"
         lines.append(f"  Gravity: {gravity_status}")
 
+        # Control mode
+        if self.control_mode == "cartesian":
+            mode_display = f"{t.cyan}CARTESIAN{t.normal}"
+        else:
+            mode_display = f"{t.normal}JOINT{t.normal}"
+        lines.append(f"  Control Mode: {mode_display}")
+
         # Show colliding pairs if any
         if self.collision_detected and len(self.colliding_pairs) > 0:
             lines.append(f"  {t.red}Colliding Pairs ({len(self.colliding_pairs)}):{t.normal}")
@@ -785,22 +809,32 @@ class SO101Simulation:
         lines.append("")
         lines.append(t.bold + "  CONTROLS:" + t.normal)
 
-        # Define controls in three columns
-        col1 = [
-            (f"{t.yellow}1-6{t.normal}    Select joint"),
-            (f"{t.yellow}W/UP{t.normal}   Increase (+{STEP_SIZE}deg)"),
-            (f"{t.yellow}S/DN{t.normal}   Decrease (-{STEP_SIZE}deg)"),
-            (f"{t.yellow}A/LT{t.normal}   Previous joint"),
-            (f"{t.yellow}D/RT{t.normal}   Next joint"),
-        ]
+        # Define controls in three columns (mode-aware)
+        if self.control_mode == "cartesian":
+            col1 = [
+                (f"{t.yellow}W/UP{t.normal}   Move forward (+X)"),
+                (f"{t.yellow}S/DN{t.normal}   Move backward (-X)"),
+                (f"{t.yellow}A/LT{t.normal}   Move left (-Y)"),
+                (f"{t.yellow}D/RT{t.normal}   Move right (+Y)"),
+                (f"{t.yellow}Q{t.normal}      Move up (+Z)"),
+            ]
+        else:
+            col1 = [
+                (f"{t.yellow}1-6{t.normal}    Select joint"),
+                (f"{t.yellow}W/UP{t.normal}   Increase (+{STEP_SIZE}deg)"),
+                (f"{t.yellow}S/DN{t.normal}   Decrease (-{STEP_SIZE}deg)"),
+                (f"{t.yellow}A/LT{t.normal}   Previous joint"),
+                (f"{t.yellow}D/RT{t.normal}   Next joint"),
+            ]
 
         col2 = [
             (f"{t.yellow}+/-{t.normal}    Large (+/-{LARGE_STEP_SIZE}deg)"),
             (f"{t.yellow}SPC{t.normal}    Pause/Resume"),
+            (f"{t.yellow}M{t.normal}      Toggle JOINT/CARTESIAN"),
             (f"{t.yellow}G{t.normal}      Toggle gravity"),
             (f"{t.yellow}C{t.normal}      Toggle collision"),
             (f"{t.yellow}V{t.normal}      Toggle viz"),
-            (f"{t.yellow}E{t.normal}      Toggle env"),
+            (f"{t.yellow}E{t.normal}      {'Z-down (Cart)' if self.control_mode == 'cartesian' else 'Toggle env'}"),
         ]
 
         col3 = [
@@ -929,6 +963,101 @@ class SO101Simulation:
             self.v = np.zeros(model.nv)
             self.ball_vel = np.zeros(3)
             self.add_command("Gravity OFF")
+
+    def toggle_control_mode(self):
+        """Toggle between joint and Cartesian control modes."""
+        if self.control_mode == "joint":
+            self.control_mode = "cartesian"
+            # Update end-effector target to current position (use joint pose)
+            pin.forwardKinematics(model, self.data, self.q)
+            ee_pose = self.data.oMi[self.ee_joint_id]
+            self.ee_target_pos = ee_pose.translation.copy()
+            self.add_command("Cartesian Control Mode")
+        else:
+            self.control_mode = "joint"
+            self.add_command("Joint Control Mode")
+
+    def solve_ik(self, target_pos, max_iter=100, tol=1e-3):
+        """
+        Solve inverse kinematics to move end-effector to target position.
+        Uses damped least squares method with joint-based Jacobian.
+        Based on inverse-kinematics-3d.py pattern.
+
+        Args:
+            target_pos: Target position for end-effector
+            max_iter: Maximum iterations (default 100)
+            tol: Convergence tolerance in meters (default 1mm)
+
+        Returns: True if IK converged, False otherwise
+        """
+        q_ik = self.q.copy()
+
+        # Create target pose (use JOINT pose, not frame pose!)
+        pin.forwardKinematics(model, self.data, q_ik)
+        initial_pose = self.data.oMi[self.ee_joint_id]
+        oMdes = pin.SE3(initial_pose.rotation, target_pos)
+
+        initial_pos = initial_pose.translation.copy()
+        initial_error = np.linalg.norm(target_pos - initial_pos)
+        logger.debug(f"IK Start: current={initial_pos}, target={target_pos}, initial_error={initial_error*1000:.2f}mm")
+
+        # IK parameters (from inverse-kinematics-3d.py)
+        DT = 1e-1
+        damp = 1e-6
+
+        for i in range(max_iter):
+            # Forward kinematics
+            pin.forwardKinematics(model, self.data, q_ik)
+
+            # Current end-effector pose (use JOINT pose!)
+            oMcurrent = self.data.oMi[self.ee_joint_id]
+
+            # SE3 error
+            iMd = oMcurrent.actInv(oMdes)
+
+            # Position error only (simple translation, no log map!)
+            err = iMd.translation
+            pos_err_norm = np.linalg.norm(err)
+
+            # Check convergence
+            if pos_err_norm < tol:
+                self.q = q_ik
+                logger.debug(f"IK converged in {i+1}/{max_iter} iterations, final error: {pos_err_norm*1000:.2f}mm")
+                return True
+
+            # Compute JOINT Jacobian (returns directly, like inverse-kinematics-3d.py!)
+            J = pin.computeJointJacobian(model, self.data, q_ik, self.ee_joint_id)
+
+            # Extract position part only (first 3 rows)
+            J = -J[:3, :]
+
+            # Lock base joints (first 6 DOF)
+            J[:, :6] = 0.0
+
+            # Solve using damped least squares
+            v = -J.T @ np.linalg.solve(J @ J.T + damp * np.eye(3), err)
+
+            # Integrate
+            q_ik = pin.integrate(model, q_ik, v * DT)
+
+        # Did not converge
+        curr_pos = self.data.oMi[self.ee_joint_id].translation
+        final_error = np.linalg.norm(target_pos - curr_pos)
+        logger.warning(f"IK failed after {max_iter} iterations, final error: {final_error*1000:.2f}mm")
+        return False
+
+    def move_ee_cartesian(self, direction, distance=CARTESIAN_STEP):
+        """Move end-effector in Cartesian direction."""
+        # Update target position
+        self.ee_target_pos += direction * distance
+
+        # Solve IK
+        if self.solve_ik(self.ee_target_pos):
+            self.add_command(f"EE moved {direction*distance}")
+        else:
+            # Revert target if IK failed
+            self.ee_target_pos -= direction * distance
+            self.add_command("IK failed")
 
     def update_physics(self, dt):
         """Update physics simulation for one timestep."""
@@ -1062,6 +1191,10 @@ class SO101Simulation:
                             logger.info("Toggle gravity requested")
                             self.toggle_gravity()
 
+                        elif key.lower() == 'm':
+                            logger.info("Toggle control mode requested")
+                            self.toggle_control_mode()
+
                         # F-keys for saving states (F1-F9)
                         elif key.name and key.name.startswith('KEY_F') and len(key.name) == 6:
                             try:
@@ -1088,36 +1221,56 @@ class SO101Simulation:
                                 self.load_state(num)
 
                         elif key.name == 'KEY_LEFT' or key.lower() == 'a':
-                            self.selected_joint = (self.selected_joint - 1) % len(JOINT_NAMES)
-                            self.add_command(f"Selected: {JOINT_NAMES[self.selected_joint]}")
+                            if self.control_mode == "cartesian":
+                                # Move left (-Y)
+                                self.move_ee_cartesian(np.array([0, -1, 0]))
+                                self.update_display()
+                            else:
+                                self.selected_joint = (self.selected_joint - 1) % len(JOINT_NAMES)
+                                self.add_command(f"Selected: {JOINT_NAMES[self.selected_joint]}")
 
                         elif key.name == 'KEY_RIGHT' or key.lower() == 'd':
-                            self.selected_joint = (self.selected_joint + 1) % len(JOINT_NAMES)
-                            self.add_command(f"Selected: {JOINT_NAMES[self.selected_joint]}")
+                            if self.control_mode == "cartesian":
+                                # Move right (+Y)
+                                self.move_ee_cartesian(np.array([0, 1, 0]))
+                                self.update_display()
+                            else:
+                                self.selected_joint = (self.selected_joint + 1) % len(JOINT_NAMES)
+                                self.add_command(f"Selected: {JOINT_NAMES[self.selected_joint]}")
 
                         elif key.name == 'KEY_UP' or key.lower() == 'w':
-                            step = LARGE_STEP_SIZE if key.name == 'KEY_SUP' else STEP_SIZE
-                            old_pos = self.get_joint_position(self.selected_joint)
-                            new_pos = old_pos + step
-                            joint_name = JOINT_NAMES[self.selected_joint]
-
-                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                            if self.control_mode == "cartesian":
+                                # Move forward (+X)
+                                self.move_ee_cartesian(np.array([1, 0, 0]))
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
+                                step = LARGE_STEP_SIZE if key.name == 'KEY_SUP' else STEP_SIZE
+                                old_pos = self.get_joint_position(self.selected_joint)
+                                new_pos = old_pos + step
+                                joint_name = JOINT_NAMES[self.selected_joint]
+
+                                if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                    self.update_display()
+                                    self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
+                                else:
+                                    self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                         elif key.name == 'KEY_DOWN' or key.lower() == 's':
-                            step = LARGE_STEP_SIZE if key.name == 'KEY_SDOWN' else STEP_SIZE
-                            old_pos = self.get_joint_position(self.selected_joint)
-                            new_pos = old_pos - step
-                            joint_name = JOINT_NAMES[self.selected_joint]
-
-                            if self.set_joint_position_safe(self.selected_joint, new_pos):
+                            if self.control_mode == "cartesian":
+                                # Move backward (-X)
+                                self.move_ee_cartesian(np.array([-1, 0, 0]))
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
+                                step = LARGE_STEP_SIZE if key.name == 'KEY_SDOWN' else STEP_SIZE
+                                old_pos = self.get_joint_position(self.selected_joint)
+                                new_pos = old_pos - step
+                                joint_name = JOINT_NAMES[self.selected_joint]
+
+                                if self.set_joint_position_safe(self.selected_joint, new_pos):
+                                    self.update_display()
+                                    self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
+                                else:
+                                    self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                         elif key.lower() in ['+', '=']:
                             old_pos = self.get_joint_position(self.selected_joint)
@@ -1140,6 +1293,20 @@ class SO101Simulation:
                                 self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg (large)")
                             else:
                                 self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
+
+                        elif key.lower() == 'q':
+                            if self.control_mode == "cartesian":
+                                # Move up (+Z)
+                                self.move_ee_cartesian(np.array([0, 0, 1]))
+                                self.update_display()
+                            # In joint mode, 'q' is for quit (already handled above)
+
+                        elif key.lower() == 'e':
+                            if self.control_mode == "cartesian":
+                                # Move down (-Z)
+                                self.move_ee_cartesian(np.array([0, 0, -1]))
+                                self.update_display()
+                            # In joint mode, no action for 'e' currently
 
                     except Exception as e:
                         # Log exceptions in the inner loop but continue running
