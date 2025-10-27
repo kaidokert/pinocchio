@@ -24,6 +24,11 @@ eigenpy = ">=3.7.0"
 urdfdom = ">=4.0"
 meshcat-python = ">=0.3"
 matplotlib = ">=3.9.2"
+hpp-fcl = ">=2.4"
+blessed = ">=1.20.0"
+jinxed = ">=1.2.0"
+trimesh = ">=4.0"
+pycollada = ">=0.7"
 
 # This is a workaround because of nvpl issue:
 # https://github.com/conda-forge/scipy-feedstock/issues/310
@@ -50,6 +55,8 @@ configure = { cmd = [
   ".",
   "-DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX",
   "-DCMAKE_BUILD_TYPE=$PINOCCHIO_BUILD_TYPE",
+  "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache",
+  "-DCMAKE_C_COMPILER_LAUNCHER=sccache",
   "-DGENERATE_PYTHON_STUBS=$PINOCCHIO_PYTHON_STUBS",
   "-DBUILD_WITH_COLLISION_SUPPORT=$PINOCCHIO_COLLISION_SUPPORT",
   "-DBUILD_WITH_ACCELERATE_SUPPORT=$PINOCCHIO_ACCELERATE_SUPPORT",

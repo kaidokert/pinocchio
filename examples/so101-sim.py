@@ -1036,6 +1036,10 @@ class SO101Simulation:
 
             # Check convergence
             if pos_err_norm < tol:
+                # IK converged - check for collisions before accepting
+                if self.would_collide(q_ik):
+                    logger.debug(f"IK converged but solution would cause collision, rejecting")
+                    return False
                 self.q = q_ik
                 logger.debug(f"IK converged in {i+1}/{max_iter} iterations, final error: {pos_err_norm*1000:.2f}mm")
                 return True
@@ -1062,17 +1066,29 @@ class SO101Simulation:
         return False
 
     def move_ee_cartesian(self, direction, distance=CARTESIAN_STEP):
-        """Move end-effector in Cartesian direction."""
+        """
+        Move end-effector in Cartesian direction with collision avoidance.
+        If full step fails due to collision, tries smaller steps.
+        """
         # Update target position
         self.ee_target_pos += direction * distance
 
-        # Solve IK
+        # Try full step first
         if self.solve_ik(self.ee_target_pos):
             self.add_command(f"EE moved {direction*distance}")
-        else:
-            # Revert target if IK failed
-            self.ee_target_pos -= direction * distance
-            self.add_command("IK failed")
+            return
+
+        # Full step failed - try 50% step
+        self.ee_target_pos -= direction * distance  # Revert
+        self.ee_target_pos += direction * (distance * 0.5)
+
+        if self.solve_ik(self.ee_target_pos):
+            self.add_command(f"EE moved {direction*(distance*0.5)} (half step, collision avoided)")
+            return
+
+        # Half step also failed - fully revert and report blocked
+        self.ee_target_pos -= direction * (distance * 0.5)
+        self.add_command("BLOCKED - collision would occur")
 
     def update_physics(self, dt):
         """Update physics simulation for one timestep."""
