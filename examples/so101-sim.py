@@ -812,45 +812,60 @@ class SO101Simulation:
         # Define controls in three columns (mode-aware)
         if self.control_mode == "cartesian":
             col1 = [
-                (f"{t.yellow}W/UP{t.normal}   Move forward (+X)"),
-                (f"{t.yellow}S/DN{t.normal}   Move backward (-X)"),
-                (f"{t.yellow}A/LT{t.normal}   Move left (-Y)"),
-                (f"{t.yellow}D/RT{t.normal}   Move right (+Y)"),
-                (f"{t.yellow}Q{t.normal}      Move up (+Z)"),
+                ("W/UP", "Move forward (+X)"),
+                ("S/DN", "Move backward (-X)"),
+                ("A/LT", "Move left (-Y)"),
+                ("D/RT", "Move right (+Y)"),
+                ("Z", "Move up (+Z)"),
+                ("X", "Move down (-Z)"),
             ]
         else:
             col1 = [
-                (f"{t.yellow}1-6{t.normal}    Select joint"),
-                (f"{t.yellow}W/UP{t.normal}   Increase (+{STEP_SIZE}deg)"),
-                (f"{t.yellow}S/DN{t.normal}   Decrease (-{STEP_SIZE}deg)"),
-                (f"{t.yellow}A/LT{t.normal}   Previous joint"),
-                (f"{t.yellow}D/RT{t.normal}   Next joint"),
+                ("1-6", "Select joint"),
+                ("W/UP", f"Increase (+{STEP_SIZE}deg)"),
+                ("S/DN", f"Decrease (-{STEP_SIZE}deg)"),
+                ("A/LT", "Previous joint"),
+                ("D/RT", "Next joint"),
             ]
 
         col2 = [
-            (f"{t.yellow}+/-{t.normal}    Large (+/-{LARGE_STEP_SIZE}deg)"),
-            (f"{t.yellow}SPC{t.normal}    Pause/Resume"),
-            (f"{t.yellow}M{t.normal}      Toggle JOINT/CARTESIAN"),
-            (f"{t.yellow}G{t.normal}      Toggle gravity"),
-            (f"{t.yellow}C{t.normal}      Toggle collision"),
-            (f"{t.yellow}V{t.normal}      Toggle viz"),
-            (f"{t.yellow}E{t.normal}      {'Z-down (Cart)' if self.control_mode == 'cartesian' else 'Toggle env'}"),
+            ("+/-", f"Large (+/-{LARGE_STEP_SIZE}deg)"),
+            ("SPC", "Pause/Resume"),
+            ("M", "JOINT/CARTESIAN mode"),
+            ("G", "Toggle gravity"),
+            ("C", "Toggle collision"),
+            ("V", "Toggle viz"),
+            ("E", "Toggle env"),
         ]
 
         col3 = [
-            (f"{t.yellow}H{t.normal}      Home position"),
-            (f"{t.yellow}R{t.normal}      Reset sim"),
-            (f"{t.yellow}F1-9{t.normal}   Save state"),
-            (f"{t.yellow}0,7-9{t.normal}  Load state"),
-            (f"{t.yellow}Q/ESC{t.normal}  Quit"),
+            ("H", "Home position"),
+            ("R", "Reset sim"),
+            ("F1-9", "Save state"),
+            ("0,7-9", "Load state"),
+            ("Q/ESC", "Quit"),
         ]
 
-        # Print side by side in three columns
+        # Print side by side in three columns with proper alignment
         for i in range(max(len(col1), len(col2), len(col3))):
-            c1 = f"    {col1[i]}" if i < len(col1) else ""
-            c2 = f"{col2[i]}" if i < len(col2) else ""
-            c3 = f"{col3[i]}" if i < len(col3) else ""
-            lines.append(f"{c1:28s} {c2:26s} {c3}")
+            parts = []
+            if i < len(col1):
+                key, desc = col1[i]
+                parts.append(f"    {t.yellow}{key:8s}{t.normal} {desc:24s}")
+            else:
+                parts.append(" " * 38)
+
+            if i < len(col2):
+                key, desc = col2[i]
+                parts.append(f"{t.yellow}{key:8s}{t.normal} {desc:20s}")
+            else:
+                parts.append(" " * 30)
+
+            if i < len(col3):
+                key, desc = col3[i]
+                parts.append(f"{t.yellow}{key:8s}{t.normal} {desc}")
+
+            lines.append("".join(parts))
         lines.append("")
 
         # Status line
@@ -1294,19 +1309,17 @@ class SO101Simulation:
                             else:
                                 self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
-                        elif key.lower() == 'q':
+                        elif key.lower() == 'z':
                             if self.control_mode == "cartesian":
                                 # Move up (+Z)
                                 self.move_ee_cartesian(np.array([0, 0, 1]))
                                 self.update_display()
-                            # In joint mode, 'q' is for quit (already handled above)
 
-                        elif key.lower() == 'e':
+                        elif key.lower() == 'x':
                             if self.control_mode == "cartesian":
                                 # Move down (-Z)
                                 self.move_ee_cartesian(np.array([0, 0, -1]))
                                 self.update_display()
-                            # In joint mode, no action for 'e' currently
 
                     except Exception as e:
                         # Log exceptions in the inner loop but continue running
