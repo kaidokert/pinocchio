@@ -245,18 +245,8 @@ class SO101Simulation:
         # SCALE FACTOR: Adjust this to change cup size (ideal ~0.035 for 8cm cup)
         CUP_SCALE_FACTOR = 0.035
 
-        # Find cup_3.dae file
-        possible_paths = [
-            Path("../models/scene/cup_3.dae"),
-            Path("models/scene/cup_3.dae"),
-            Path(__file__).parent.parent / "models/scene/cup_3.dae"
-        ]
-        cup_mesh_path = None
-        for p in possible_paths:
-            if p.absolute().exists():
-                cup_mesh_path = p.absolute()
-                break
-
+        # Load cup_3.dae (path relative to examples directory)
+        cup_mesh_path = (Path(__file__).parent.parent / "models/scene/cup_3.dae").absolute()
         logger.info(f"Loading cup mesh from: {cup_mesh_path}")
 
         # Load DAE with trimesh
@@ -271,9 +261,8 @@ class SO101Simulation:
         # Apply scale
         mesh.apply_scale(CUP_SCALE_FACTOR)
 
-        # Apply rotation to make upright AND fix normals
-        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
-        mesh.apply_transform(rotation)
+        # No rotation - keep original DAE orientation (opening points up in Z)
+        # The DAE file is already oriented correctly
 
         # Fix normals to prevent disappearing faces (ensures outward-pointing normals)
         mesh.fix_normals()
