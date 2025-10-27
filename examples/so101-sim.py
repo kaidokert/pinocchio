@@ -4,6 +4,7 @@
 import argparse
 import logging
 import os
+import statistics
 import sys
 import time
 import traceback
@@ -34,6 +35,10 @@ STEP_SIZE = 2.0  # degrees per keypress
 LARGE_STEP_SIZE = 10.0  # degrees with Shift
 DT = 0.01  # simulation timestep
 STORE_DIR = Path("store")  # Directory for saved states
+
+# Loop rate control
+TARGET_LOOP_HZ = 20.0  # Target control loop frequency
+WARMUP_FRAMES = 10  # Exclude first N frames from statistics
 
 # Parse command line arguments BEFORE loading model
 parser = argparse.ArgumentParser(description="SO101 Robot Arm Simulation")
@@ -131,8 +136,10 @@ class SO101Simulation:
         self.q = pin.neutral(model)  # Configuration
         self.v = np.zeros(model.nv)  # Velocity
 
-        # Set initial base position (sitting on ground)
-        self.q[2] = 0.0  # Z position at ground level
+        # Set initial base position (slightly above ground)
+        self.q[0] = 0.0  # X position
+        self.q[1] = 0.0  # Y position
+        self.q[2] = 0.004  # Z position (2cm above ground for clearance)
 
         # Control state
         self.running = True
@@ -145,6 +152,21 @@ class SO101Simulation:
         self.enable_collision_detection = enable_collision
         self.show_collision_geom = enable_collision  # Show by default when collision enabled
         self.prevent_collisions = enable_collision  # Prevent commanded motions that would collide
+        self.prevent_environment_collision = enable_collision  # Prevent robot-environment collisions
+
+        # Track geometry indices by type
+        self.robot_geom_indices = list(range(collision_model.ngeoms))  # Robot geometries (initially all)
+        self.environment_geom_indices = []  # Environment geometries (ground, obstacles)
+
+        # Add environment collision geometries
+        if enable_collision:
+            self.add_environment_collision()
+
+        # Loop rate tracking
+        self.frame_count = 0
+        self.frame_times = []  # All frame times (for warmup exclusion)
+        self.last_frame_time = None
+        self.target_hz = TARGET_LOOP_HZ
 
         # Display initial state
         self.viz.display(self.q)
@@ -168,6 +190,143 @@ class SO101Simulation:
         self.viz.viewer["ground"].set_transform(
             tf.translation_matrix([0, 0, -0.005])
         )
+
+    def add_environment_collision(self):
+        """Add environment objects (ground, obstacles) to collision model."""
+        try:
+            import hppfcl
+        except ImportError:
+            logger.warning("hppfcl not available - skipping environment collision")
+            return
+
+        logger.info("Adding environment collision geometries...")
+
+        # Ground plane collision geometry
+        ground_shape = hppfcl.Box(2.0, 2.0, 0.01)  # 2m x 2m x 1cm
+        ground_placement = pin.SE3(np.eye(3), np.array([0, 0, -0.005]))
+
+        ground_geom_obj = pin.GeometryObject(
+            "collision_ground",
+            0,  # world frame (universe frame)
+            ground_placement,
+            ground_shape
+        )
+
+        # Add to collision model
+        ground_idx = collision_model.addGeometryObject(ground_geom_obj)
+        self.environment_geom_indices.append(ground_idx)
+
+        # Add collision pairs: each robot geometry <-> ground
+        for robot_idx in self.robot_geom_indices:
+            collision_model.addCollisionPair(
+                pin.CollisionPair(robot_idx, ground_idx)
+            )
+
+        logger.info(f"Added ground collision geometry at index {ground_idx}")
+        logger.info(f"Added {len(self.robot_geom_indices)} robot<->ground collision pairs")
+
+        # Re-create collision data after modifying collision model
+        self.collision_data = pin.GeometryData(collision_model)
+
+        # Add cup to scene
+        self.add_cup()
+
+    def add_cup(self):
+        """Add a cup mesh to the scene with visualization and collision."""
+        import meshcat.geometry as g
+        import meshcat.transformations as tf
+        import trimesh
+        import io
+        import hppfcl
+
+        # Cup position in world
+        cup_pos = np.array([0.3, 0.0, 0.05])  # 30cm in front, on ground
+
+        # SCALE FACTOR: Adjust this to change cup size (ideal ~0.035 for 8cm cup)
+        CUP_SCALE_FACTOR = 0.035
+
+        # Find cup_3.dae file
+        possible_paths = [
+            Path("../models/scene/cup_3.dae"),
+            Path("models/scene/cup_3.dae"),
+            Path(__file__).parent.parent / "models/scene/cup_3.dae"
+        ]
+        cup_mesh_path = None
+        for p in possible_paths:
+            if p.absolute().exists():
+                cup_mesh_path = p.absolute()
+                break
+
+        logger.info(f"Loading cup mesh from: {cup_mesh_path}")
+
+        # Load DAE with trimesh
+        loaded = trimesh.load(str(cup_mesh_path))
+
+        # Convert Scene to Mesh if needed
+        if isinstance(loaded, trimesh.Scene):
+            mesh = loaded.to_geometry()
+        else:
+            mesh = loaded
+
+        # Apply scale
+        mesh.apply_scale(CUP_SCALE_FACTOR)
+
+        # Apply rotation to make upright AND fix normals
+        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+        mesh.apply_transform(rotation)
+
+        # Fix normals to prevent disappearing faces (ensures outward-pointing normals)
+        mesh.fix_normals()
+
+        logger.debug(f"Mesh after transforms: bounds={mesh.bounds}, {len(mesh.vertices)} vertices")
+
+        # Export as OBJ for visualization
+        obj_data = mesh.export(file_type='obj')
+        obj_bytes = obj_data.encode('utf-8') if isinstance(obj_data, str) else obj_data
+        obj_stream = io.BytesIO(obj_bytes)
+
+        # Load into MeshCat
+        obj_geom = g.ObjMeshGeometry.from_stream(obj_stream)
+        cup_material = g.MeshLambertMaterial(color=0xffaa88, opacity=0.8, side=2)  # side=2 = DoubleSide
+        self.viz.viewer["scene"]["cup"].set_object(obj_geom, cup_material)
+        self.viz.viewer["scene"]["cup"].set_transform(tf.translation_matrix(cup_pos))
+
+        logger.info(f"Cup visualization loaded at {cup_pos} (scale={CUP_SCALE_FACTOR})")
+
+        # Create collision geometry from mesh
+        vertices = mesh.vertices
+        faces = mesh.faces
+
+        cup_collision_shape = hppfcl.BVHModelOBBRSS()
+        cup_collision_shape.beginModel(len(vertices), len(faces))
+        cup_collision_shape.addVertices(vertices)
+        cup_collision_shape.addTriangles(faces)
+        cup_collision_shape.endModel()
+
+        # Mesh is already rotated and scaled, just translate
+        cup_placement = pin.SE3(np.eye(3), cup_pos)
+
+        cup_geom_obj = pin.GeometryObject(
+            "collision_cup",
+            0,  # world frame
+            cup_placement,
+            cup_collision_shape
+        )
+
+        # Add to collision model
+        cup_idx = collision_model.addGeometryObject(cup_geom_obj)
+        self.environment_geom_indices.append(cup_idx)
+
+        # Add collision pairs with robot
+        for robot_idx in self.robot_geom_indices:
+            collision_model.addCollisionPair(
+                pin.CollisionPair(robot_idx, cup_idx)
+            )
+
+        logger.info(f"Cup collision added: {len(vertices)} vertices, {len(faces)} triangles at index {cup_idx}")
+
+        # Re-create collision data
+        self.collision_data = pin.GeometryData(collision_model)
 
     def add_test_ball(self):
         """Add a test ball to demonstrate gravity."""
@@ -452,7 +611,11 @@ class SO101Simulation:
 
     def would_collide(self, q_test):
         """Check if a given configuration would cause collision (without modifying current state)."""
-        if not self.enable_collision_detection or not self.prevent_collisions:
+        if not self.enable_collision_detection:
+            return False
+
+        # If both prevention flags are off, allow all motion
+        if not self.prevent_collisions and not self.prevent_environment_collision:
             return False
 
         try:
@@ -463,10 +626,35 @@ class SO101Simulation:
             # Update collision geometry placements with test configuration
             pin.updateGeometryPlacements(model, data_test, collision_model, collision_data_test, q_test)
 
-            # Compute collisions (stop at first for efficiency)
-            is_colliding = pin.computeCollisions(collision_model, collision_data_test, stop_at_first_collision=True)
+            # Compute collisions (don't stop at first - need to categorize)
+            pin.computeCollisions(collision_model, collision_data_test, stop_at_first_collision=False)
 
-            return is_colliding
+            # Categorize collisions
+            has_self_collision = False
+            has_env_collision = False
+
+            for idx, pair in enumerate(collision_model.collisionPairs):
+                if collision_data_test.collisionResults[idx].isCollision():
+                    geom1_idx = pair.first
+                    geom2_idx = pair.second
+
+                    # Check if both are robot geometries (self-collision)
+                    if (geom1_idx in self.robot_geom_indices and
+                        geom2_idx in self.robot_geom_indices):
+                        has_self_collision = True
+
+                    # Check if one is environment
+                    if (geom1_idx in self.environment_geom_indices or
+                        geom2_idx in self.environment_geom_indices):
+                        has_env_collision = True
+
+            # Respect separate toggles
+            if self.prevent_collisions and has_self_collision:
+                return True
+            if self.prevent_environment_collision and has_env_collision:
+                return True
+
+            return False
         except Exception as e:
             logger.warning(f"Error in would_collide: {e}")
             return False  # On error, allow the motion (fail-safe)
@@ -495,12 +683,31 @@ class SO101Simulation:
             self.set_joint_position(joint_idx, value_deg)
             return True
 
+    def get_rate_stats(self):
+        """Calculate rate statistics, excluding warmup frames."""
+        # Filter out warmup frames
+        valid_times = self.frame_times[WARMUP_FRAMES:] if len(self.frame_times) > WARMUP_FRAMES else []
+
+        if len(valid_times) < 2:
+            return None  # Not enough data yet
+
+        # Calculate statistics
+        stats = {
+            'mean_hz': 1.0 / statistics.mean(valid_times),
+            'median_hz': 1.0 / statistics.median(valid_times),
+            'min_hz': 1.0 / max(valid_times),  # Longest dt = slowest rate
+            'max_hz': 1.0 / min(valid_times),  # Shortest dt = fastest rate
+            'current_hz': 1.0 / valid_times[-1] if valid_times else 0,
+            'target_hz': self.target_hz
+        }
+        return stats
+
     def draw_bar(self, value, width=20, min_val=-180, max_val=180):
         """Draw a horizontal bar representing a value in degrees."""
         normalized = (value - min_val) / (max_val - min_val)
         normalized = np.clip(normalized, 0, 1)
         filled = int(normalized * width)
-        bar = "█" * filled + "░" * (width - filled)
+        bar = "=" * filled + "-" * (width - filled)
         return bar
 
     def draw_ui(self):
@@ -527,9 +734,32 @@ class SO101Simulation:
         if self.collision_detected and len(self.colliding_pairs) > 0:
             lines.append(f"  {t.red}Colliding Pairs ({len(self.colliding_pairs)}):{t.normal}")
             for geom1, geom2 in self.colliding_pairs[:5]:  # Show first 5
-                lines.append(f"    • {geom1} <-> {geom2}")
+                lines.append(f"    - {geom1} <-> {geom2}")
             if len(self.colliding_pairs) > 5:
                 lines.append(f"    ... and {len(self.colliding_pairs) - 5} more")
+        lines.append("")
+
+        # Loop rate statistics
+        rate_stats = self.get_rate_stats()
+        if rate_stats:
+            # Color code based on performance
+            current_hz = rate_stats['current_hz']
+            target_hz = rate_stats['target_hz']
+            if current_hz >= target_hz * 0.9:
+                rate_color = t.green  # Within 90% of target
+            elif current_hz >= target_hz * 0.7:
+                rate_color = t.yellow  # Within 70% of target
+            else:
+                rate_color = t.red  # Below 70% of target
+
+            lines.append(f"  Loop Rate: {rate_color}{current_hz:.1f} Hz{t.normal} " +
+                        f"(target: {target_hz:.0f} Hz)")
+            lines.append(f"    Mean: {rate_stats['mean_hz']:.1f} Hz  " +
+                        f"Median: {rate_stats['median_hz']:.1f} Hz  " +
+                        f"Min: {rate_stats['min_hz']:.1f}  " +
+                        f"Max: {rate_stats['max_hz']:.1f}")
+        else:
+            lines.append(f"  Loop Rate: {t.dim}Measuring... (frame {self.frame_count}/{WARMUP_FRAMES + 2}){t.normal}")
         lines.append("")
 
         # Joint positions with bars
@@ -542,7 +772,7 @@ class SO101Simulation:
             # Highlight selected joint
             if i == self.selected_joint:
                 color = t.black_on_green
-                marker = " ◄"
+                marker = " <"
             else:
                 color = t.normal
                 marker = "  "
@@ -553,46 +783,50 @@ class SO101Simulation:
             # Value and bar
             bar = self.draw_bar(pos, width=20, min_val=-180, max_val=180)
             value_color = t.green if -180 <= pos <= 180 else t.red
-            lines.append(f"      {value_color}{pos:+7.2f}°{t.normal} │{bar}│")
+            lines.append(f"      {value_color}{pos:+7.2f}deg{t.normal} |{bar}|")
             lines.append("")
 
-        # Controls in two columns
-        lines.append("  " + "─" * 60)
+        # Controls in three columns
+        lines.append("  " + "-" * 60)
         lines.append("")
         lines.append(t.bold + "  CONTROLS:" + t.normal)
 
-        # Define controls in two columns
+        # Define controls in three columns
         col1 = [
-            (f"{t.yellow}1-6{t.normal}         Select joint"),
-            (f"{t.yellow}↑/W{t.normal}         Increase (+{STEP_SIZE}°)"),
-            (f"{t.yellow}↓/S{t.normal}         Decrease (-{STEP_SIZE}°)"),
-            (f"{t.yellow}←/A{t.normal}         Previous joint"),
-            (f"{t.yellow}→/D{t.normal}         Next joint"),
-            (f"{t.yellow}+/-{t.normal}         Large step (±{LARGE_STEP_SIZE}°)"),
-            (f"{t.yellow}SPACE{t.normal}       Pause/Resume"),
-            (f"{t.yellow}G{t.normal}           Apply gravity"),
+            (f"{t.yellow}1-6{t.normal}    Select joint"),
+            (f"{t.yellow}W/UP{t.normal}   Increase (+{STEP_SIZE}deg)"),
+            (f"{t.yellow}S/DN{t.normal}   Decrease (-{STEP_SIZE}deg)"),
+            (f"{t.yellow}A/LT{t.normal}   Previous joint"),
+            (f"{t.yellow}D/RT{t.normal}   Next joint"),
         ]
 
         col2 = [
-            (f"{t.yellow}C{t.normal}           Toggle collision"),
-            (f"{t.yellow}V{t.normal}           Toggle collision viz"),
-            (f"{t.yellow}H{t.normal}           Home position"),
-            (f"{t.yellow}R{t.normal}           Reset simulation"),
-            (f"{t.yellow}F1-F9{t.normal}       Save state (1-9)"),
-            (f"{t.yellow}0,7-9{t.normal}       Load state"),
-            (f"{t.yellow}Q/ESC{t.normal}       Quit"),
-            (""),
+            (f"{t.yellow}+/-{t.normal}    Large (+/-{LARGE_STEP_SIZE}deg)"),
+            (f"{t.yellow}SPC{t.normal}    Pause/Resume"),
+            (f"{t.yellow}G{t.normal}      Apply gravity"),
+            (f"{t.yellow}C{t.normal}      Toggle collision"),
+            (f"{t.yellow}V{t.normal}      Toggle viz"),
+            (f"{t.yellow}E{t.normal}      Toggle env"),
         ]
 
-        # Print side by side
-        for i in range(max(len(col1), len(col2))):
-            left = f"    {col1[i]}" if i < len(col1) else " " * 35
-            right = f"{col2[i]}" if i < len(col2) else ""
-            lines.append(f"{left:45s} {right}")
+        col3 = [
+            (f"{t.yellow}H{t.normal}      Home position"),
+            (f"{t.yellow}R{t.normal}      Reset sim"),
+            (f"{t.yellow}F1-9{t.normal}   Save state"),
+            (f"{t.yellow}0,7-9{t.normal}  Load state"),
+            (f"{t.yellow}Q/ESC{t.normal}  Quit"),
+        ]
+
+        # Print side by side in three columns
+        for i in range(max(len(col1), len(col2), len(col3))):
+            c1 = f"    {col1[i]}" if i < len(col1) else ""
+            c2 = f"{col2[i]}" if i < len(col2) else ""
+            c3 = f"{col3[i]}" if i < len(col3) else ""
+            lines.append(f"{c1:28s} {c2:26s} {c3}")
         lines.append("")
 
         # Status line
-        lines.append("  " + "─" * 60)
+        lines.append("  " + "-" * 60)
         lines.append(f"  Last: {t.cyan}{self.last_command}{t.normal}")
 
         # Command history
@@ -755,11 +989,28 @@ class SO101Simulation:
 
                 while self.running:
                     try:
+                        # Measure frame start time
+                        frame_start = time.time()
+
                         # Draw UI
                         self.draw_ui()
 
-                        # Get key with timeout
-                        key = t.inkey(timeout=0.05)
+                        # Calculate elapsed time for this frame so far
+                        frame_elapsed = time.time() - frame_start
+
+                        # Calculate dynamic timeout to maintain target rate
+                        target_frame_time = 1.0 / self.target_hz
+                        timeout = max(0.0, target_frame_time - frame_elapsed)
+
+                        # Get key with dynamic timeout (0 if we're behind schedule)
+                        key = t.inkey(timeout=timeout)
+
+                        # Track frame timing (after inkey completes)
+                        if self.last_frame_time is not None:
+                            dt = frame_start - self.last_frame_time
+                            self.frame_times.append(dt)
+                        self.last_frame_time = frame_start
+                        self.frame_count += 1
 
                         if not key:
                             continue
@@ -788,6 +1039,11 @@ class SO101Simulation:
                                 self.update_collision_visualization()
                             status = "shown" if self.show_collision_geom else "hidden"
                             self.add_command(f"Collision geometries {status}")
+
+                        elif key.lower() == 'e':
+                            self.prevent_environment_collision = not self.prevent_environment_collision
+                            status = "ON" if self.prevent_environment_collision else "OFF"
+                            self.add_command(f"Environment collision prevention: {status}")
 
                         elif key.lower() == 'h':
                             logger.info("Home position requested")
@@ -842,9 +1098,9 @@ class SO101Simulation:
 
                             if self.set_joint_position_safe(self.selected_joint, new_pos):
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                         elif key.name == 'KEY_DOWN' or key.lower() == 's':
                             step = LARGE_STEP_SIZE if key.name == 'KEY_SDOWN' else STEP_SIZE
@@ -854,9 +1110,9 @@ class SO101Simulation:
 
                             if self.set_joint_position_safe(self.selected_joint, new_pos):
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                         elif key.lower() in ['+', '=']:
                             old_pos = self.get_joint_position(self.selected_joint)
@@ -865,9 +1121,9 @@ class SO101Simulation:
 
                             if self.set_joint_position_safe(self.selected_joint, new_pos):
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg (large)")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                         elif key.lower() in ['-', '_']:
                             old_pos = self.get_joint_position(self.selected_joint)
@@ -876,9 +1132,9 @@ class SO101Simulation:
 
                             if self.set_joint_position_safe(self.selected_joint, new_pos):
                                 self.update_display()
-                                self.add_command(f"{joint_name}: {old_pos:+.2f}° → {new_pos:+.2f}° (large)")
+                                self.add_command(f"{joint_name}: {old_pos:+.2f}deg -> {new_pos:+.2f}deg (large)")
                             else:
-                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}°")
+                                self.add_command(f"{joint_name}: BLOCKED - collision would occur at {new_pos:+.2f}deg")
 
                     except Exception as e:
                         # Log exceptions in the inner loop but continue running
