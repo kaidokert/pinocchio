@@ -41,6 +41,15 @@ STORE_DIR = Path("store")  # Directory for saved states
 TARGET_LOOP_HZ = 20.0  # Target control loop frequency
 WARMUP_FRAMES = 10  # Exclude first N frames from statistics
 
+# Gripper and grasping parameters
+GRIPPER_JOINT_IDX = 12  # Index of gripper joint in configuration vector (q)
+GRIPPER_JOINT_VEL_IDX = 11  # Index of gripper joint in velocity vector (v)
+GRIPPER_OPEN_ANGLE = 1.5  # radians (~86 degrees) - wide open
+GRIPPER_CLOSED_ANGLE = -0.1  # radians (~-6 degrees) - closed
+GRIPPER_SPEED = 3.0  # radians per second
+GRASP_DISTANCE_THRESHOLD = 0.06  # meters - max distance to grasp ball (6cm)
+BALL_RADIUS = 0.03  # meters - ball radius (3cm)
+
 # Parse command line arguments BEFORE loading model
 parser = argparse.ArgumentParser(description="SO101 Robot Arm Simulation")
 parser.add_argument(
@@ -112,6 +121,12 @@ class SO101Simulation:
             self.ball_pos = np.array([0.3, 0.3, 0.5])  # Start 50cm above ground
             self.ball_vel = np.zeros(3)
             self.add_test_ball()
+
+            # Grasping state
+            self.ball_grasped = False  # Is ball currently grasped?
+            self.grasp_offset = np.zeros(3)  # Offset from gripper frame to ball when grasped
+            self.gripper_target_angle = GRIPPER_OPEN_ANGLE  # Target angle for gripper joint
+            logger.info("Grasping system initialized")
 
             # Cartesian control state (end-effector target)
             # Will be initialized after forward kinematics is computed
@@ -748,6 +763,14 @@ class SO101Simulation:
             mode_display = f"{t.normal}JOINT{t.normal}"
         lines.append(f"  Control Mode: {mode_display}")
 
+        # Grasping status
+        gripper_angle_deg = np.degrees(self.q[GRIPPER_JOINT_IDX])
+        if self.ball_grasped:
+            grasp_display = f"{t.green}GRASPED!{t.normal}"
+        else:
+            grasp_display = f"{t.normal}FREE{t.normal}"
+        lines.append(f"  Gripper: {gripper_angle_deg:6.1f}° - Ball: {grasp_display}")
+
         # Show colliding pairs if any
         if self.collision_detected and len(self.colliding_pairs) > 0:
             lines.append(f"  {t.red}Colliding Pairs ({len(self.colliding_pairs)}):{t.normal}")
@@ -839,6 +862,8 @@ class SO101Simulation:
         ]
 
         col3 = [
+            ("O", "Open gripper"),
+            ("P", "Close/Pick"),
             ("H", "Home position"),
             ("R", "Reset sim"),
             ("F1-9", "Save state"),
@@ -1090,47 +1115,129 @@ class SO101Simulation:
         self.ee_target_pos -= direction * (distance * 0.5)
         self.add_command("BLOCKED - collision would occur")
 
+    def open_gripper(self):
+        """Command gripper to open."""
+        # Directly set gripper velocity to open
+        self.v[GRIPPER_JOINT_VEL_IDX] = GRIPPER_SPEED
+
+        # Release ball if grasped
+        if self.ball_grasped:
+            self.release_ball()
+            self.add_command("Gripper OPENING - ball released")
+        else:
+            self.add_command("Gripper OPENING")
+
+        logger.info(f"Gripper opening at {GRIPPER_SPEED} rad/s")
+
+    def close_gripper(self):
+        """Command gripper to close and attempt to grasp ball."""
+        # Directly set gripper velocity to close
+        self.v[GRIPPER_JOINT_VEL_IDX] = -GRIPPER_SPEED
+        self.add_command("Gripper CLOSING")
+        logger.info(f"Gripper closing at {-GRIPPER_SPEED} rad/s")
+
+        # Try to grasp if not already grasping
+        if not self.ball_grasped:
+            self.attempt_grasp()
+
+    def attempt_grasp(self):
+        """Attempt to grasp the ball if it's within range."""
+        # Update forward kinematics to get current gripper frame position
+        pin.forwardKinematics(model, self.data, self.q)
+        pin.updateFramePlacements(model, self.data)
+
+        # Get gripper frame ID (we already have this from __init__)
+        gripper_frame_id = model.getFrameId("gripper")
+        gripper_pose = self.data.oMf[gripper_frame_id]
+        gripper_pos = gripper_pose.translation
+
+        # Calculate distance to ball
+        distance = np.linalg.norm(self.ball_pos - gripper_pos)
+
+        logger.info(f"Attempting grasp: distance to ball = {distance*1000:.1f}mm")
+
+        # Check if ball is within grasp range
+        if distance <= GRASP_DISTANCE_THRESHOLD:
+            # Grasp successful!
+            self.ball_grasped = True
+            self.grasp_offset = self.ball_pos - gripper_pos
+            self.add_command(f"GRASPED! (dist={distance*1000:.1f}mm)")
+            logger.info(f"Ball grasped! Offset: {self.grasp_offset}")
+        else:
+            self.add_command(f"Too far to grasp ({distance*1000:.1f}mm > {GRASP_DISTANCE_THRESHOLD*1000:.0f}mm)")
+            logger.info("Grasp failed: ball too far")
+
+    def release_ball(self):
+        """Release the grasped ball."""
+        if not self.ball_grasped:
+            return
+
+        # Compute gripper velocity to give to ball
+        # Use finite difference of gripper position
+        pin.forwardKinematics(model, self.data, self.q)
+        pin.updateFramePlacements(model, self.data)
+        gripper_frame_id = model.getFrameId("gripper")
+
+        # Get gripper frame velocity (approximation from joint velocities)
+        # J * v_joints = v_ee
+        J_gripper = pin.computeFrameJacobian(
+            model, self.data, self.q, gripper_frame_id, pin.LOCAL_WORLD_ALIGNED
+        )
+        v_ee = J_gripper @ self.v  # 6D velocity (linear + angular)
+
+        # Extract linear velocity (first 3 components)
+        self.ball_vel = v_ee[:3].copy()
+
+        self.ball_grasped = False
+        logger.info(f"Ball released with velocity: {self.ball_vel}")
+
     def update_physics(self, dt):
         """Update physics simulation for one timestep."""
         if not self.gravity_enabled or self.paused:
             return
 
-        # Gravity constant
+        # Gravity constant (only applied to ball, not robot)
         gravity = np.array([0, 0, -9.81])  # m/s^2
 
-        # ---- Robot dynamics ----
-        tau = np.zeros(model.nv)  # No control torques
-
-        # Compute forward dynamics (ABA algorithm)
-        a = pin.aba(model, self.data, self.q, self.v, tau)
-
-        # Lock the base position (first 6 DOF)
-        a[:6] = 0.0
-
-        # Add damping to arm joints
-        a[6:] *= 0.95  # 5% damping
-
-        # Integrate velocity
-        self.v += a * dt
-        self.v[:6] = 0.0  # Lock base velocity
-
-        # Integrate position
-        self.q = pin.integrate(model, self.q, self.v * dt)
+        # ---- Robot: Pure kinematic control (NO DYNAMICS) ----
+        # Robot moves based on commanded velocities (from user input)
+        # Gripper is controlled by open_gripper()/close_gripper() methods only
+        # No automatic servos, no forces, no torques, no gravity on robot!
 
         # ---- Ball physics (simple particle) ----
-        # Apply gravity acceleration
-        self.ball_vel += gravity * dt
+        if self.ball_grasped:
+            # Ball is grasped - follow gripper frame
+            pin.forwardKinematics(model, self.data, self.q)
+            pin.updateFramePlacements(model, self.data)
 
-        # Update position
-        self.ball_pos += self.ball_vel * dt
+            gripper_frame_id = model.getFrameId("gripper")
+            gripper_pose = self.data.oMf[gripper_frame_id]
+            gripper_pos = gripper_pose.translation
 
-        # Ground collision (simple)
-        BALL_RADIUS = 0.03  # 3cm radius
-        if self.ball_pos[2] < BALL_RADIUS:
-            self.ball_pos[2] = BALL_RADIUS
-            self.ball_vel[2] = -self.ball_vel[2] * 0.6  # Bounce with energy loss
-            if abs(self.ball_vel[2]) < 0.002:  # Stop if moving < 2mm/s
-                self.ball_vel = np.zeros(3)  # Fully stop the ball
+            # Update ball position to maintain grasp offset
+            self.ball_pos = gripper_pos + self.grasp_offset
+
+            # Ball velocity matches gripper velocity
+            J_gripper = pin.computeFrameJacobian(
+                model, self.data, self.q, gripper_frame_id, pin.LOCAL_WORLD_ALIGNED
+            )
+            v_ee = J_gripper @ self.v
+            self.ball_vel = v_ee[:3].copy()
+
+        else:
+            # Ball is free - apply physics
+            # Apply gravity acceleration
+            self.ball_vel += gravity * dt
+
+            # Update position
+            self.ball_pos += self.ball_vel * dt
+
+            # Ground collision (simple)
+            if self.ball_pos[2] < BALL_RADIUS:
+                self.ball_pos[2] = BALL_RADIUS
+                self.ball_vel[2] = -self.ball_vel[2] * 0.6  # Bounce with energy loss
+                if abs(self.ball_vel[2]) < 0.002:  # Stop if moving < 2mm/s
+                    self.ball_vel = np.zeros(3)  # Fully stop the ball
 
         # Update displays
         self.update_ball_position()
@@ -1336,6 +1443,16 @@ class SO101Simulation:
                                 # Move down (-Z)
                                 self.move_ee_cartesian(np.array([0, 0, -1]))
                                 self.update_display()
+
+                        elif key.lower() == 'o':
+                            # Open gripper
+                            self.open_gripper()
+                            self.update_display()
+
+                        elif key.lower() == 'p':
+                            # Close gripper / Pick
+                            self.close_gripper()
+                            self.update_display()
 
                     except Exception as e:
                         # Log exceptions in the inner loop but continue running

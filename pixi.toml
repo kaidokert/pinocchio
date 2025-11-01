@@ -39,7 +39,7 @@ blas = { version = "*", build = "netlib" }
 scripts = ["development/scripts/pixi/activation.sh"]
 
 [target.win-64.activation]
-scripts = ["development/scripts/pixi/activation.bat"]
+scripts = ["development/scripts/pixi/activation.bat", "development/scripts/pixi/custom_activation.bat"]
 
 [tasks]
 # We must avoid to set CMAKE_CXX_FLAGS because of WIN32
@@ -74,6 +74,16 @@ clean = { cmd = "rm -rf build" }
 test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = [
   "build",
 ] }
+run_viewer = { cmd = "python meshcat-viewer.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_ur5 = { cmd = "python ur5-viewer.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_so101 = { cmd = "python so101-viewer.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_so100_minimal = { cmd = "python so100-minimal-viewer.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_so100 = { cmd = "python so100-viewer.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_so101_sim = { cmd = "python so101-sim.py --collision", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_so101_new = { cmd = "python so101-new.py --collision", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+test_dae_loader = { cmd = "python -u test-dae-loader.py", cwd = "examples" }
+run_so101_collision_check = { cmd = "python so101-collision-check.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
+run_test_so101_crash = { cmd = "python test-so101-sim-crash.py", cwd = "examples", env = { PINOCCHIO_WINDOWS_DLL_PATH = "E:/m/robot/pinocchio/build/src;E:/m/robot/pinocchio/.pixi/envs/default/Library/bin", PYTHONPATH = "E:/m/robot/pinocchio/build/bindings/python;E:/m/robot/pinocchio/models/example-robot-data/python", EXAMPLE_ROBOT_DATA_MODEL_DIR = "E:/m/robot/pinocchio/models/example-robot-data/robots", PYTHONDONTWRITEBYTECODE = "1" } }
 
 # Increment the version number with PINOCCHIO_VERSION variable
 [feature.new-version.dependencies]
@@ -254,3 +264,8 @@ new-version = { features = [
   "collision",
   "py312",
 ], solve-group = "py312" }
+
+[pypi-dependencies]
+eclipse-zenoh = ">=1.6.2, <2"
+xsdata = ">=25.7, <26"
+pip = ">=25.3, <26"
